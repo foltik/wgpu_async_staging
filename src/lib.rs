@@ -1,5 +1,3 @@
-#![feature(async_closure)]
-
 struct Chunk {
     buffer: wgpu::Buffer,
     size: u64,
@@ -124,14 +122,28 @@ impl StagingBelt {
             self.free_chunks.push(chunk);
         }
 
-        let _sender = &self.sender;
-        futures::future::join_all(self.closed_chunks.drain(..).map(async move |chunk| {
-            let sender = _sender.clone();
-            chunk
-                .buffer
-                .slice(..)
-                .map_async(wgpu::MapMode::Write).await.unwrap();
-            sender.send(chunk).await.unwrap();
-        })).await;
+        let sender = self.sender.clone();
+        let mut mapping_futures = Vec::new();
+
+        for chunk in self.closed_chunks.drain(..) {
+            let sender = sender.clone();
+            let buffer_slice = chunk.buffer.slice(..);
+
+            let (tx, rx) = futures::channel::oneshot::channel();
+            buffer_slice.map_async(wgpu::MapMode::Write, move |result| {
+                let _ = tx.send(result);
+            });
+
+            let future = async move {
+                if let Ok(result) = rx.await {
+                    result.unwrap();
+                    sender.send(chunk).await.unwrap();
+                }
+            };
+
+            mapping_futures.push(future);
+        }
+
+        futures::future::join_all(mapping_futures).await;
     }
 }
